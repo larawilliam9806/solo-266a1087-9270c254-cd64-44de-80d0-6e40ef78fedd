@@ -165,6 +165,73 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("无法解析", response.get_json()["error"])
 
+    def test_post_shipment_supplement_still_validated(self):
+        # Both supplemented records are after the shipment; minute order,
+        # row order and existing supplements must still be checked.
+        warehouse = (
+            "记录号,分钟时间,动作\n"
+            "W-001,2026-11-24 10:00,换签\n"
+            "W-002,2026-11-24 10:05,交运\n"
+            "W-003,2026-11-24 10:10,换签\n"
+            "W-004,2026-11-24 10:10,换签\n"
+        )
+        qc = (
+            "记录号,分钟时间,动作\n"
+            "Q-001,2026-11-24 10:06,验封通过\n"
+            "Q-002,2026-11-24 10:09,验封失败\n"
+            "Q-003,2026-11-24 10:10,验封通过\n"
+        )
+        detail = self.client.post(
+            "/api/cases",
+            data={
+                "box_code": "POST-SHIP",
+                "warehouse_file": (io.BytesIO(warehouse.encode()), "w.csv"),
+                "qc_file": (io.BytesIO(qc.encode()), "q.csv"),
+            },
+            content_type="multipart/form-data",
+        ).get_json()
+        case_id = detail["case"]["id"]
+
+        # Minute conflict: Q-002 (10:09) is necessarily before W-003 (10:10).
+        conflict = self.client.post(
+            f"/api/cases/{case_id}/supplements",
+            json={"before_uid": "W::W-003", "after_uid": "Q::Q-002"},
+        )
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(len(conflict.get_json()["state"]["supplements"]), 0)
+
+        # A consistent post-shipment supplement is accepted.
+        ok = self.client.post(
+            f"/api/cases/{case_id}/supplements",
+            json={"before_uid": "Q::Q-003", "after_uid": "W::W-003"},
+        )
+        self.assertEqual(ok.status_code, 200, ok.get_data(as_text=True))
+        self.assertEqual(len(ok.get_json()["supplements"]), 1)
+
+        # Row-order cycle: W-003 precedes W-004 by CSV row in the same
+        # minute; W-004 < Q-003 would close a loop through Q-003 < W-003.
+        conflict = self.client.post(
+            f"/api/cases/{case_id}/supplements",
+            json={"before_uid": "W::W-004", "after_uid": "Q::Q-003"},
+        )
+        self.assertEqual(conflict.status_code, 409)
+        state = conflict.get_json()["state"]
+        self.assertEqual(len(state["supplements"]), 1)
+
+        # Reverse of an existing supplement conflicts as well.
+        conflict = self.client.post(
+            f"/api/cases/{case_id}/supplements",
+            json={"before_uid": "W::W-003", "after_uid": "Q::Q-003"},
+        )
+        self.assertEqual(conflict.status_code, 409)
+
+        persisted = self.client.get(f"/api/cases/{case_id}").get_json()
+        self.assertEqual(len(persisted["supplements"]), 1)
+        self.assertEqual(
+            persisted["supplements"][0]["before_uid"], "Q::Q-003"
+        )
+        self.assertEqual(len(persisted["history"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

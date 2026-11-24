@@ -9,10 +9,13 @@ from verifier import (  # noqa: E402
     KIND_PASS,
     KIND_RELABEL,
     KIND_SHIPMENT,
+    ConflictError,
+    VerificationError,
     analyze,
     build_graph,
     compute_closure,
     kahn_toposort,
+    validate_new_supplement,
 )
 
 
@@ -104,6 +107,130 @@ def test_fixed_examples():
     assert result["compliant_order"] and result["noncompliant_order"]
 
 
+def _full_minute_records(spec):
+    """Build records with full minute keys: (table, minute, row, kind)."""
+    out = []
+    for table, minute, row, kind in spec:
+        rid = f"{table[0].upper()}{minute}-{row}"
+        out.append(
+            {
+                "uid": ("W::" if table == "W" else "Q::") + rid,
+                "table": "warehouse" if table == "W" else "qc",
+                "record_no": rid,
+                "minute_key": f"20261124{minute:04d}",
+                "minute_text": f"m{minute}",
+                "row_no": row,
+                "action_raw": kind,
+                "kind": kind,
+            }
+        )
+    return out
+
+
+def _assert_full_valid_order(records, supplements, uid_order):
+    n = len(records)
+    assert len(uid_order) == n, "见证顺序必须包含全部记录"
+    assert len(set(uid_order)) == n
+    pos = {uid: i for i, uid in enumerate(uid_order)}
+    adj, _ = build_graph(records, supplements)
+    for u, vs in enumerate(adj):
+        for v in vs:
+            assert pos[records[u]["uid"]] < pos[records[v]["uid"]]
+
+
+def test_shipment_alone_in_minute_counts_earlier_records():
+    # 交运那一分钟只有交运一笔；更早分钟的验封通过必须被计入。
+    records = _full_minute_records(
+        [
+            ("W", 1000, 1, KIND_RELABEL),
+            ("Q", 1003, 1, KIND_PASS),
+            ("W", 1005, 1, KIND_SHIPMENT),
+        ]
+    )
+    result = analyze(records, [])
+    assert result["verdict"] == "always_compliant", result
+    assert result["compliant_order"] == ["W::W1000-1", "Q::Q1003-1", "W::W1005-1"]
+    _assert_full_valid_order(records, [], result["compliant_order"])
+
+    # 更早分钟是验封失败 -> 必然不合格。
+    records = _full_minute_records(
+        [
+            ("W", 1000, 1, KIND_RELABEL),
+            ("Q", 1003, 1, KIND_FAIL),
+            ("W", 1005, 1, KIND_SHIPMENT),
+        ]
+    )
+    result = analyze(records, [])
+    assert result["verdict"] == "always_noncompliant", result
+    _assert_full_valid_order(records, [], result["noncompliant_order"])
+
+    # 前一分钟跨表各一笔 -> 两种结论都有可能，且两条顺序都含全部记录。
+    records = _full_minute_records(
+        [
+            ("W", 1004, 1, KIND_RELABEL),
+            ("Q", 1004, 1, KIND_PASS),
+            ("W", 1005, 1, KIND_SHIPMENT),
+        ]
+    )
+    result = analyze(records, [])
+    assert result["verdict"] == "ambiguous", result
+    assert result["compliant_order"] == ["W::W1004-1", "Q::Q1004-1", "W::W1005-1"]
+    assert result["noncompliant_order"] == ["Q::Q1004-1", "W::W1004-1", "W::W1005-1"]
+    _assert_full_valid_order(records, [], result["compliant_order"])
+    _assert_full_valid_order(records, [], result["noncompliant_order"])
+
+
+def test_post_shipment_supplements_still_checked():
+    # 两条记录都在交运之后：分钟、行序和已有补记仍要核对。
+    records = _full_minute_records(
+        [
+            ("W", 1000, 1, KIND_RELABEL),
+            ("W", 1005, 1, KIND_SHIPMENT),
+            ("Q", 1006, 1, KIND_PASS),
+            ("Q", 1009, 1, KIND_FAIL),
+            ("W", 1010, 1, KIND_RELABEL),
+            ("W", 1010, 2, KIND_RELABEL),
+            ("Q", 1010, 1, KIND_PASS),
+        ]
+    )
+    # 分钟冲突：Q1009(10:09) 必然早于 W1010-1(10:10)，反向补记成环。
+    try:
+        validate_new_supplement(records, [], "W::W1010-1", "Q::Q1009-1")
+        raise AssertionError("expected ConflictError")
+    except ConflictError:
+        pass
+
+    # 与已有补记方向相反（两条记录都在交运之后）。
+    existing = [{"before_uid": "Q::Q1006-1", "after_uid": "W::W1010-1"}]
+    result = validate_new_supplement(records, existing, "Q::Q1006-1", "W::W1010-1")
+    assert result["verdict"] in {
+        "always_compliant",
+        "always_noncompliant",
+        "ambiguous",
+    }
+    try:
+        validate_new_supplement(records, existing, "W::W1010-1", "Q::Q1006-1")
+        raise AssertionError("expected ConflictError")
+    except ConflictError:
+        pass
+
+    # 行序冲突：同表同分钟 W1010-1 行序在 W1010-2 前；
+    # 已有 Q1010-1 < W1010-1，再补 W1010-2 < Q1010-1 会经行序成环。
+    existing = [{"before_uid": "Q::Q1010-1", "after_uid": "W::W1010-1"}]
+    try:
+        validate_new_supplement(records, existing, "W::W1010-2", "Q::Q1010-1")
+        raise AssertionError("expected ConflictError")
+    except ConflictError:
+        pass
+
+    # 同表补记仍然被拒绝。
+    try:
+        validate_new_supplement(records, [], "W::W1010-1", "W::W1010-2")
+        raise AssertionError("expected VerificationError")
+    except VerificationError:
+        pass
+
+
 def test_exhaustive_random():
     rng = random.Random(12345)
     kinds_w = [KIND_RELABEL] * 3 + [KIND_SHIPMENT]
@@ -184,5 +311,7 @@ def test_exhaustive_random():
 
 if __name__ == "__main__":
     test_fixed_examples()
+    test_shipment_alone_in_minute_counts_earlier_records()
+    test_post_shipment_supplements_still_checked()
     test_exhaustive_random()
     print("all verifier tests passed")

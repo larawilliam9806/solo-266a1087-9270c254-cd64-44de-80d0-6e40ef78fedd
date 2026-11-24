@@ -10,10 +10,12 @@ from typing import Any
 from flask import (
     Flask,
     abort,
+    current_app,
     jsonify,
     redirect,
     render_template,
     request,
+    stream_template,
     url_for,
 )
 
@@ -181,14 +183,14 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 ),
             )
 
-            for record in records:
-                db.execute(
-                    """
-                    INSERT INTO records (
-                        case_id, uid, table_name, record_no, minute_key,
-                        minute_text, row_no, action_raw, kind
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+            db.executemany(
+                """
+                INSERT INTO records (
+                    case_id, uid, table_name, record_no, minute_key,
+                    minute_text, row_no, action_raw, kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
                     (
                         case_id,
                         record["uid"],
@@ -199,8 +201,10 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                         record["row_no"],
                         record["action_raw"],
                         record["kind"],
-                    ),
-                )
+                    )
+                    for record in records
+                ],
+            )
 
             payload = json.dumps(conclusion, ensure_ascii=False)
             conclusion_cursor = db.execute(
@@ -236,7 +240,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         ).fetchone()
         return row is not None
 
-    def get_detail(case_id: str) -> dict[str, Any] | None:
+    def get_detail(case_id: str, with_items: bool = True) -> dict[str, Any] | None:
         db = get_db()
         case_row = db.execute(
             "SELECT * FROM cases WHERE id = ?", (case_id,)
@@ -249,7 +253,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         for row in db.execute(
             "SELECT * FROM records WHERE case_id = ? ORDER BY id",
             (case_id,),
-        ).fetchall():
+        ):
             record = dict(row)
             # The verifier calls this field "table"; SQLite stores it as
             # table_name to avoid ambiguity in SQL.
@@ -260,7 +264,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             for row in db.execute(
                 "SELECT * FROM supplements WHERE case_id = ? ORDER BY id",
                 (case_id,),
-            ).fetchall()
+            )
         ]
 
         conclusion_row = None
@@ -280,14 +284,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if conclusion:
             for key in ("compliant_order", "noncompliant_order"):
                 uids = conclusion.get(key)
-                if uids is not None:
+                if uids is None:
+                    continue
+                conclusion[f"{key}_record_numbers"] = [
+                    records_by_uid[uid]["record_no"]
+                    for uid in uids
+                    if uid in records_by_uid
+                ]
+                if with_items:
+                    # Full record dicts per order step are only needed for
+                    # server-side page rendering.  They are left out of API
+                    # JSON so a 50k-record case does not serialise every
+                    # record three times.
                     conclusion[f"{key}_items"] = [
                         records_by_uid[uid]
-                        for uid in uids
-                        if uid in records_by_uid
-                    ]
-                    conclusion[f"{key}_record_numbers"] = [
-                        records_by_uid[uid]["record_no"]
                         for uid in uids
                         if uid in records_by_uid
                     ]
@@ -420,22 +430,20 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         after_uid = resolve_record_ref(case_id, after_ref, after_table)
 
         db = get_db()
-        record_rows = db.execute(
+        records = []
+        for row in db.execute(
             "SELECT * FROM records WHERE case_id = ? ORDER BY id",
             (case_id,),
-        ).fetchall()
-        records = []
-        for row in record_rows:
+        ):
             record = dict(row)
             record["table"] = record["table_name"]
             records.append(record)
-        supplement_rows = db.execute(
-            "SELECT * FROM supplements WHERE case_id = ? ORDER BY id",
-            (case_id,),
-        ).fetchall()
         existing = [
             {"before_uid": row["before_uid"], "after_uid": row["after_uid"]}
-            for row in supplement_rows
+            for row in db.execute(
+                "SELECT * FROM supplements WHERE case_id = ? ORDER BY id",
+                (case_id,),
+            )
         ]
 
         before_record = next(r for r in records if r["uid"] == before_uid)
@@ -458,7 +466,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         conclusion = validate_new_supplement(records, existing, before_uid, after_uid)
 
         if duplicate:
-            detail = get_detail(case_id)
+            detail = get_detail(case_id, with_items=False)
             return detail, True
 
         created_at = now_iso()
@@ -511,7 +519,27 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except Exception:
             db.rollback()
             raise
-        return get_detail(case_id), False
+        return get_detail(case_id, with_items=False), False
+
+    def _coalesce(stream, chunk_size: int = 65536):
+        """Merge tiny template pieces into larger chunks for the WSGI server."""
+        buffer: list[str] = []
+        size = 0
+        for piece in stream:
+            buffer.append(piece)
+            size += len(piece)
+            if size >= chunk_size:
+                yield "".join(buffer)
+                buffer = []
+                size = 0
+        if buffer:
+            yield "".join(buffer)
+
+    def render_case_page(**context):
+        # Stream the (potentially very large) case page so a 50k-record
+        # case never materialises the whole HTML document in memory.
+        stream = _coalesce(stream_template("case.html", **context))
+        return current_app.response_class(stream)
 
     @app.get("/health")
     def health():
@@ -542,7 +570,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
             case_id = create_case_from_request()
         except VerificationError as exc:
             return jsonify(error=str(exc)), 400
-        return jsonify(get_detail(case_id)), 201
+        return jsonify(get_detail(case_id, with_items=False)), 201
 
     @app.get("/cases/<case_id>")
     def case_detail(case_id: str):
@@ -550,8 +578,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         if detail is None:
             abort(404)
         added = request.args.get("added") == "1"
-        return render_template(
-            "case.html",
+        return render_case_page(
             **detail,
             error_message=None,
             conflict=False,
@@ -567,8 +594,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except ConflictError as exc:
             detail = get_detail(case_id)
             return (
-                render_template(
-                    "case.html",
+                render_case_page(
                     **detail,
                     error_message=str(exc),
                     conflict=True,
@@ -579,8 +605,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
         except VerificationError as exc:
             detail = get_detail(case_id)
             return (
-                render_template(
-                    "case.html",
+                render_case_page(
                     **detail,
                     error_message=str(exc),
                     conflict=False,
@@ -599,7 +624,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/cases/<case_id>")
     def case_detail_api(case_id: str):
-        detail = get_detail(case_id)
+        detail = get_detail(case_id, with_items=False)
         if detail is None:
             return jsonify(error="案例不存在"), 404
         return jsonify(detail)
@@ -616,7 +641,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                     error=str(exc),
                     conflict=True,
                     rejected=True,
-                    state=get_detail(case_id),
+                    state=get_detail(case_id, with_items=False),
                 ),
                 409,
             )
@@ -625,7 +650,7 @@ def create_app(test_config: dict[str, Any] | None = None) -> Flask:
                 jsonify(
                     error=str(exc),
                     rejected=True,
-                    state=get_detail(case_id),
+                    state=get_detail(case_id, with_items=False),
                 ),
                 400,
             )

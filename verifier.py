@@ -11,8 +11,10 @@ procedure can be tested directly.  It uses a partial order:
 Because every accepted action is one of pass/fail/relabel/shipment, a compliant
 sequence is exactly one in which the record immediately before shipment is a
 seal pass.  The final pass is then also the last relevant event before
-shipment.  Possibility is tested with bitset reachability rather than by
-enumerating permutations.
+shipment.  Possibility is decided from two breadth-first sweeps around the
+shipment record (ancestors/descendants as byte arrays), so memory stays
+linear in the record count and ~50k-record ledgers fit within a 512 MiB
+address space; permutations are never enumerated.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import csv
 import heapq
 import io
+import itertools
 import re
 from typing import Any, Iterable
 
@@ -268,12 +271,21 @@ def normalise_action(raw: Any, table: str) -> str:
 
 
 def parse_csv(raw: bytes | str, table: str) -> list[dict[str, Any]]:
-    """Parse one ledger CSV into record dictionaries."""
+    """Parse one ledger CSV into record dictionaries.
+
+    Rows are consumed as a stream so a 50k-row file does not get
+    materialised twice (raw rows plus parsed records).
+    """
     if table not in _TABLE_LABEL:
         raise VerificationError(f"未知表类型：{table}")
 
     text = decode_raw(raw)
-    first_line = next((line for line in text.splitlines() if line.strip()), "")
+    stream = io.StringIO(text)
+    first_line = ""
+    for line in stream:
+        if line.strip():
+            first_line = line
+            break
     delimiter = ","
     if first_line.count("\t") > first_line.count(","):
         delimiter = "\t"
@@ -281,13 +293,15 @@ def parse_csv(raw: bytes | str, table: str) -> list[dict[str, Any]]:
         delimiter = ";"
     elif first_line.count("，") > first_line.count(","):
         delimiter = "，"
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
-    rows = [row for row in reader if any(str(cell).strip() for cell in row)]
-    if not rows:
+    stream.seek(0)
+    reader = csv.reader(stream, delimiter=delimiter)
+    rows = (row for row in reader if any(str(cell).strip() for cell in row))
+    first_row = next(rows, None)
+    if first_row is None:
         raise CsvParseError(f"{_TABLE_LABEL[table]} CSV 没有任何内容")
 
     header_index: dict[str, int] = {}
-    for idx, cell in enumerate(rows[0]):
+    for idx, cell in enumerate(first_row):
         header_index[_normalise_header(cell)] = idx
 
     field_indexes: dict[str, int | None] = {}
@@ -301,10 +315,10 @@ def parse_csv(raw: bytes | str, table: str) -> list[dict[str, Any]]:
         field_indexes[field] = found
 
     if all(v is not None for v in field_indexes.values()):
-        data_rows = rows[1:]
+        data_rows = rows
     else:
         # Headerless CSV: record number, minute, action in positional order.
-        data_rows = rows
+        data_rows = itertools.chain([first_row], rows)
         field_indexes = {"record": 0, "minute": 1, "action": 2}
 
     records: list[dict[str, Any]] = []
@@ -469,7 +483,12 @@ def kahn_toposort(adj: list[set[int]]) -> list[int]:
 def compute_closure(
     adj: list[set[int]], topo: list[int]
 ) -> tuple[list[int], list[int]]:
-    """Return descendant and ancestor bitsets (bit i corresponds to node i)."""
+    """Return descendant and ancestor bitsets (bit i corresponds to node i).
+
+    Kept for backwards compatibility and small-scale checks.  ``analyze``
+    no longer uses it: the bitsets cost O(n^2 / 8) bytes, which exceeds a
+    512 MiB address space once n approaches 50k.
+    """
     n = len(adj)
     reach = [0] * n
     for u in reversed(topo):
@@ -484,6 +503,36 @@ def compute_closure(
         for v in adj[u]:
             ancestors[v] |= u_and_ancestors
     return reach, ancestors
+
+
+def _reverse_adjacency(adj: list[set[int]]) -> list[list[int]]:
+    radj: list[list[int]] = [[] for _ in range(len(adj))]
+    for u, neighbours in enumerate(adj):
+        for v in neighbours:
+            radj[v].append(u)
+    return radj
+
+
+def _strict_reachability(adj: list, starts: Iterable[int]) -> bytearray:
+    """Mark nodes strictly reachable from ``starts`` in a DAG.
+
+    The start nodes themselves stay unmarked (a DAG has no path back to a
+    start node), so byte i is 1 iff node i is a strict descendant of some
+    start node.  Memory is exactly n bytes.
+    """
+    seen = bytearray(len(adj))
+    stack: list[int] = []
+    for node in starts:
+        if not seen[node]:
+            seen[node] = 1
+            stack.append(node)
+    while stack:
+        u = stack.pop()
+        for v in adj[u]:
+            if not seen[v]:
+                seen[v] = 1
+                stack.append(v)
+    return seen
 
 
 def can_be_adjacent(
@@ -599,14 +648,50 @@ def analyze(
     records: list[dict[str, Any]],
     supplements: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Compute the three-way verdict and witness orders."""
+    """Compute the three-way verdict and witness orders.
+
+    Memory-linear implementation.  Instead of an O(n^2)-bit transitive
+    closure (which pushes a 50k-record case past a 512 MiB address space),
+    it runs two breadth-first sweeps from the shipment ``s``:
+
+    * ``x`` can sit immediately before ``s`` in some linear extension iff
+      ``s`` is not forced before ``x`` and no ``y`` is forced strictly
+      between them (``x < y < s``) — the contraction of ``(x, s)`` is then
+      acyclic.
+    * For ``x < s``, a forced ``y`` exists iff some direct successor of
+      ``x`` is also an ancestor of ``s`` (any ``x < y < s`` path starts
+      with such a successor), so the check is local.
+    * For ``x`` incomparable with ``s`` the condition is vacuous.
+
+    Records after the shipment are never special-cased or dropped: the
+    graph, the cycle check and the witness orders always cover every
+    record, so supplements between post-shipment records are still
+    validated against minutes, row order and earlier supplements.
+    """
     records = list(records)
     supplement_list = list(supplements or [])
     shipment_record = validate_case_records(records)
     adj, index = build_graph(records, supplement_list)
-    topo = kahn_toposort(adj)
-    reach, ancestors = compute_closure(adj, topo)
+    kahn_toposort(adj)  # raises ConflictError if supplements close a cycle
     shipment = index[shipment_record["uid"]]
+
+    radj = _reverse_adjacency(adj)
+    ancestors = _strict_reachability(radj, radj[shipment])
+    descendants = _strict_reachability(adj, adj[shipment])
+
+    def can_immediately_precede(x: int) -> bool:
+        if x == shipment or descendants[x]:
+            return False
+        if not ancestors[x]:
+            # Incomparable with the shipment: nothing can be forced
+            # between x and s because x < y < s would imply x < s.
+            return True
+        # x < s: some y with x < y < s exists iff a direct successor of
+        # x is itself an ancestor of s.
+        for y in adj[x]:
+            if ancestors[y]:
+                return False
+        return True
 
     passes = [i for i, r in enumerate(records) if r["kind"] == KIND_PASS]
     bads = [
@@ -618,7 +703,7 @@ def analyze(
     compliant_indexes: list[int] | None = None
     compliant_witness: int | None = None
     for candidate in passes:
-        if not can_be_adjacent(candidate, shipment, reach, ancestors):
+        if not can_immediately_precede(candidate):
             continue
         order = contracted_adjacent_order(adj, candidate, shipment)
         if order is not None:
@@ -629,7 +714,7 @@ def analyze(
     noncompliant_indexes: list[int] | None = None
     noncompliant_witness: int | None = None
     for candidate in bads:
-        if not can_be_adjacent(candidate, shipment, reach, ancestors):
+        if not can_immediately_precede(candidate):
             continue
         order = contracted_adjacent_order(adj, candidate, shipment)
         if order is not None:
@@ -638,7 +723,7 @@ def analyze(
             break
 
     shipment_first_witness = False
-    if noncompliant_indexes is None and ancestors[shipment] == 0:
+    if noncompliant_indexes is None and not any(ancestors):
         order = toposort_with_forced_first(adj, shipment)
         if order is not None:
             noncompliant_indexes = order
